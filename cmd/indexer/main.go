@@ -88,24 +88,26 @@ func runLive(cfg *config.Config) {
 	db, rpc := initDeps(cfg, passphrase)
 	defer db.Close()
 
-	if cfg.MetricsAddr != "" {
-		srv := httpserver.New(cfg.MetricsAddr, db.DB())
+	if cfg.ListenAddr() != "" {
+		srv := httpserver.New(cfg.ListenAddr(), db.DB())
+		srv.SetDomainReader(db)
 		go func() {
-			log.Printf("metrics server listening on %s (/metrics, /healthz)", cfg.MetricsAddr)
+			log.Printf("http server listening on %s (/metrics, /healthz, /v1/domains)", cfg.ListenAddr())
 			if err := srv.Start(); err != nil {
-				log.Printf("metrics server error: %v", err)
+				log.Printf("http server error: %v", err)
 			}
 		}()
 		defer func() {
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer shutdownCancel()
 			if err := srv.Shutdown(shutdownCtx); err != nil {
-				log.Printf("metrics server shutdown error: %v", err)
+				log.Printf("http server shutdown error: %v", err)
 			}
 		}()
 	}
 
 	p := pipeline.NewLivePipeline(rpc, db, passphrase, cfg.BatchSize)
+	p.SetRegistryContractIDs(cfg.RegistryContractIDs())
 
 	// Attach Redis publisher if configured
 	if cfg.RedisURL != "" {
@@ -141,6 +143,7 @@ func runBackfill(cfg *config.Config) {
 	defer db.Close()
 
 	p := pipeline.NewBackfillPipeline(rpc, db, passphrase, cfg.BatchSize, cfg.WorkerCount)
+	p.SetRegistryContractIDs(cfg.RegistryContractIDs())
 
 	log.Printf("Starting backfill from ledger %d to %d...", startLedger, endLedger)
 	if err := p.Run(ctx, startLedger, endLedger); err != nil && err != context.Canceled {
@@ -162,6 +165,7 @@ func runS3Backfill(cfg *config.Config) {
 	defer db.Close()
 
 	p := pipeline.NewS3BackfillPipeline(db, cfg.WorkerCount)
+	p.SetRegistryContractIDs(cfg.RegistryContractIDs())
 
 	log.Printf("Starting S3 data lake backfill from ledger %d to %d...", startLedger, endLedger)
 	if err := p.Run(ctx, startLedger, endLedger); err != nil && err != context.Canceled {

@@ -32,14 +32,19 @@ make build
 | `REDIS_URL`    | `redis://localhost:63790`                                                             | No       | Redis connection (optional — logs warning if unavailable) |
 | `BATCH_SIZE`   | `100`                                                                                 | No       | Ledgers per batch                                         |
 | `WORKER_COUNT` | `8`                                                                                   | No       | Parallel workers for `backfill` and `s3backfill`          |
-| `METRICS_ADDR` | —                                                                                     | No       | Listen address (e.g. `:9090`) for `/metrics` and `/healthz` during `live` ingestion. Disabled when unset. |
+| `METRICS_ADDR` | —                                                                                     | No       | Listen address (e.g. `:9090`) for `/metrics` and `/healthz` during `live` ingestion. Disabled when unset. Also serves the domains read API when `HTTP_ADDR` is unset. |
+| `HTTP_ADDR`    | —                                                                                     | No       | Listen address for the domains read API (and `/metrics` `/healthz`). Overrides `METRICS_ADDR` when both are set. |
+| `DOMAINS_REGISTRY_CONTRACT_ID` | pubnet default (see below) | No | Comma-separated Soroban Domains registry contract ID(s). Required on testnet/futurenet. |
 
 ### Observability
 
-When `METRICS_ADDR` is set, `live` starts an HTTP server alongside ingestion:
+When `METRICS_ADDR` or `HTTP_ADDR` is set, `live` starts an HTTP server alongside ingestion:
 
 - `GET /metrics` -- Prometheus exposition format. Exposes `indexer_ledgers_ingested_total`, `indexer_transactions_ingested_total`, `indexer_operations_ingested_total`, `indexer_rpc_errors_total`, `indexer_db_errors_total`, and the `indexer_ingestion_lag_ledgers` gauge (network tip minus last ingested ledger).
 - `GET /healthz` -- liveness/readiness probe. Returns `200` when the database is reachable and the ingestion loop has completed a poll cycle within the last 2 minutes, `503` otherwise (with a generic `reason`, never the raw database error). Suitable for Docker/k8s health checks.
+- `GET /v1/domains` -- Soroban Domains read API (resolve by name, reverse lookup, list, event history). Response shape is frozen in [docs/domains-api.md](docs/domains-api.md). `indexed: false` means ingestion has not started yet — not an error.
+
+On pubnet the indexer watches registry contract `CC75Z72OCE667WVPQOROIWDAGBOXFNJ4VQONQEURL74EYIDLWA4F7FEN` unless `DOMAINS_REGISTRY_CONTRACT_ID` is set. Testnet and futurenet have no default; set the env var to enable domain ingestion.
 
 ## Commands
 
@@ -153,7 +158,8 @@ To wipe all ingested data and start fresh (useful after testing with different n
 ```bash
 docker compose -f infra/docker-compose.yml exec postgres psql -U explorer -d stellar_explorer -c "
   TRUNCATE ledgers, transactions, operations, effects, accounts, contracts,
-    contract_events, token_events, assets, trades, network_stats, ingestion_state CASCADE;
+    contract_events, token_events, assets, trades, network_stats, ingestion_state,
+    domains, domain_events CASCADE;
 "
 ```
 

@@ -37,25 +37,35 @@ type dbPinger interface {
 // simulate a stuck pipeline without depending on real elapsed time.
 type staleChecker func(maxAge time.Duration) bool
 
-// Server serves /metrics and /healthz for a running indexer process.
+// Server serves /metrics, /healthz, and the domains read API.
 type Server struct {
-	srv *http.Server
+	srv     *http.Server
+	domains DomainReader
 }
 
 // New builds a Server listening on addr. db is used by /healthz to verify
 // the database is reachable and confirm the live pipeline is still
 // advancing.
 func New(addr string, db dbPinger) *Server {
+	s := &Server{}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", healthzHandler(db, health.Stale))
+	mux.HandleFunc("GET /v1/domains/{name}/events", s.handleDomainEvents)
+	mux.HandleFunc("GET /v1/domains/{name}", s.handleDomainByName)
+	mux.HandleFunc("GET /v1/domains", s.handleDomains)
 
-	return &Server{
-		srv: &http.Server{
-			Addr:    addr,
-			Handler: mux,
-		},
+	s.srv = &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
+	return s
+}
+
+// SetDomainReader attaches the domains store used by the read API. When unset,
+// domain endpoints return HTTP 200 with indexed=false.
+func (s *Server) SetDomainReader(r DomainReader) {
+	s.domains = r
 }
 
 // Start blocks serving requests until the server is shut down. It returns
