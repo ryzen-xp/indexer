@@ -81,14 +81,15 @@ func applyOneDomainEvent(ctx context.Context, dbTx *sql.Tx, ev DomainEvent) erro
 	return nil
 }
 
+const domainSelectCols = `
+		node, name, tld, label, owner, resolved_address, target_type,
+		registered_at, expires_at,
+		status, last_event_ledger, COALESCE(last_event_tx, ''),
+		created_at, updated_at`
+
 func getDomainByNodeTx(ctx context.Context, dbTx *sql.Tx, node string) (*Domain, error) {
-	row := dbTx.QueryRowContext(ctx, `
-		SELECT node, name, tld, label, owner, resolved_address, target_type,
-			COALESCE(registered_at, TIMESTAMPTZ 'epoch'),
-			COALESCE(expires_at, TIMESTAMPTZ 'epoch'),
-			status, last_event_ledger, COALESCE(last_event_tx, ''),
-			created_at, updated_at
-		FROM domains WHERE node = $1 FOR UPDATE`, node)
+	row := dbTx.QueryRowContext(ctx,
+		`SELECT `+domainSelectCols+` FROM domains WHERE node = $1 FOR UPDATE`, node)
 	d, err := scanDomain(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -100,13 +101,20 @@ func scanDomain(row interface {
 	Scan(dest ...interface{}) error
 }) (*Domain, error) {
 	var d Domain
+	var registered, expires sql.NullTime
 	err := row.Scan(
 		&d.Node, &d.Name, &d.TLD, &d.Label, &d.Owner, &d.ResolvedAddress, &d.TargetType,
-		&d.RegisteredAt, &d.ExpiresAt, &d.Status, &d.LastEventLedger, &d.LastEventTx,
+		&registered, &expires, &d.Status, &d.LastEventLedger, &d.LastEventTx,
 		&d.CreatedAt, &d.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if registered.Valid {
+		d.RegisteredAt = registered.Time.UTC()
+	}
+	if expires.Valid {
+		d.ExpiresAt = expires.Time.UTC()
 	}
 	return &d, nil
 }
@@ -123,13 +131,8 @@ func (s *PostgresStore) DomainsIndexed(ctx context.Context) (bool, error) {
 
 // GetDomainByName returns the current domain row for a fully-qualified name.
 func (s *PostgresStore) GetDomainByName(ctx context.Context, name string) (*Domain, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT node, name, tld, label, owner, resolved_address, target_type,
-			COALESCE(registered_at, TIMESTAMPTZ 'epoch'),
-			COALESCE(expires_at, TIMESTAMPTZ 'epoch'),
-			status, last_event_ledger, COALESCE(last_event_tx, ''),
-			created_at, updated_at
-		FROM domains WHERE name = $1`, strings.ToLower(name))
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+domainSelectCols+` FROM domains WHERE name = $1`, strings.ToLower(name))
 	d, err := scanDomain(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -140,11 +143,7 @@ func (s *PostgresStore) GetDomainByName(ctx context.Context, name string) (*Doma
 // GetDomainsByAddress returns domains whose current resolved address matches.
 func (s *PostgresStore) GetDomainsByAddress(ctx context.Context, address string) ([]Domain, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT node, name, tld, label, owner, resolved_address, target_type,
-			COALESCE(registered_at, TIMESTAMPTZ 'epoch'),
-			COALESCE(expires_at, TIMESTAMPTZ 'epoch'),
-			status, last_event_ledger, COALESCE(last_event_tx, ''),
-			created_at, updated_at
+		SELECT `+domainSelectCols+`
 		FROM domains
 		WHERE resolved_address = $1 AND name <> ''
 		ORDER BY name`, address)
@@ -163,11 +162,7 @@ func (s *PostgresStore) ListDomains(ctx context.Context, status, cursor string, 
 	}
 
 	q := `
-		SELECT node, name, tld, label, owner, resolved_address, target_type,
-			COALESCE(registered_at, TIMESTAMPTZ 'epoch'),
-			COALESCE(expires_at, TIMESTAMPTZ 'epoch'),
-			status, last_event_ledger, COALESCE(last_event_tx, ''),
-			created_at, updated_at
+		SELECT ` + domainSelectCols + `
 		FROM domains
 		WHERE name <> ''`
 	args := []interface{}{}

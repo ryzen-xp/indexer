@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
 	"time"
@@ -142,5 +143,104 @@ func TestApplyDomainEvents_ReverseLookupAndIdempotency(t *testing.T) {
 	}
 	if got.EffectiveStatus(t0) != DomainStatusExpired {
 		t.Errorf("effective status = %s, want expired", got.EffectiveStatus(t0))
+	}
+}
+
+func TestApplyDomainEvents_OutOfOrderTransferThenRegister(t *testing.T) {
+	s := getTestDB(t)
+	defer s.Close()
+
+	ctx := context.Background()
+	node := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	_, _ = s.db.ExecContext(ctx, "DELETE FROM domain_events WHERE node = $1", node)
+	_, _ = s.db.ExecContext(ctx, "DELETE FROM domains WHERE node = $1", node)
+	defer func() {
+		_, _ = s.db.ExecContext(ctx, "DELETE FROM domain_events WHERE node = $1", node)
+		_, _ = s.db.ExecContext(ctx, "DELETE FROM domains WHERE node = $1", node)
+	}()
+
+	t0 := time.Unix(1700000000, 0).UTC()
+	exp := time.Unix(1800000000, 0).UTC()
+	addr1 := "GBKPF4URAGUGPBFKQNMDDD4IY5BRRXRK2VEBULJEMVULCCODND436NIO"
+	addr2 := "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+	regAt := t0
+
+	// Transfer lands first (parallel backfill).
+	if err := s.ApplyDomainEvents(ctx, []DomainEvent{{
+		Node: node, EventType: DomainEventTransfer, ResolvedAddress: addr2,
+		TransactionHash: "1111111111111111111111111111111111111111111111111111111111111111",
+		LedgerSequence:  30, CreatedAt: t0,
+	}}); err != nil {
+		if strings.Contains(err.Error(), "does not exist") {
+			t.Skip("domains table missing; apply migrations")
+		}
+		t.Fatalf("transfer: %v", err)
+	}
+
+	var expires, registered sql.NullTime
+	if err := s.QueryRow(ctx, "SELECT expires_at, registered_at FROM domains WHERE node = $1", node).Scan(&expires, &registered); err != nil {
+		t.Fatalf("scan times after transfer: %v", err)
+	}
+	if expires.Valid {
+		t.Errorf("transfer-only row must keep expires_at NULL, got %v", expires.Time)
+	}
+	if registered.Valid {
+		t.Errorf("transfer-only row must keep registered_at NULL, got %v", registered.Time)
+	}
+
+	// Older register fills owner/expiry/name without moving the address.
+	if err := s.ApplyDomainEvents(ctx, []DomainEvent{{
+		Node: node, Name: "ooorder.xlm", TLD: "xlm", Label: "ooorder",
+		EventType: DomainEventRegister, Owner: addr1, ResolvedAddress: addr1,
+		ExpiresAt: &exp, RegisteredAt: &regAt,
+		TransactionHash: "2222222222222222222222222222222222222222222222222222222222222222",
+		LedgerSequence:  10, CreatedAt: t0,
+	}}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	d, err := s.GetDomainByName(ctx, "ooorder.xlm")
+	if err != nil || d == nil {
+		t.Fatalf("GetDomainByName: %v %#v", err, d)
+	}
+	if d.Owner != addr1 {
+		t.Errorf("owner = %q, want %s", d.Owner, addr1)
+	}
+	if d.ResolvedAddress != addr2 {
+		t.Errorf("address = %s, want transfer target %s", d.ResolvedAddress, addr2)
+	}
+	if d.RegisteredAt.IsZero() || !d.RegisteredAt.Equal(regAt) {
+		t.Errorf("registered_at = %v, want %v", d.RegisteredAt, regAt)
+	}
+	if d.ExpiresAt.IsZero() || !d.ExpiresAt.Equal(exp) {
+		t.Errorf("expires_at = %v, want %v", d.ExpiresAt, exp)
+	}
+	if d.EffectiveStatus(t0) != DomainStatusActive {
+		t.Errorf("status = %s, want active", d.EffectiveStatus(t0))
+	}
+
+	found, err := s.GetDomainsByAddress(ctx, addr2)
+	if err != nil {
+		t.Fatalf("GetDomainsByAddress: %v", err)
+	}
+	if len(found) != 1 || found[0].Name != "ooorder.xlm" || found[0].Owner != addr1 {
+		t.Errorf("reverse lookup = %+v", found)
+	}
+	if found[0].EffectiveStatus(t0) != DomainStatusActive {
+		t.Errorf("reverse-lookup status = %s, want active", found[0].EffectiveStatus(t0))
+	}
+
+	active, err := s.ListDomains(ctx, DomainStatusActive, "", 50)
+	if err != nil {
+		t.Fatalf("ListDomains: %v", err)
+	}
+	ok := false
+	for _, row := range active {
+		if row.Name == "ooorder.xlm" {
+			ok = true
+		}
+	}
+	if !ok {
+		t.Error("active list missing out-of-order domain")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -30,6 +31,8 @@ func DomainEventsFromContractEvents(events []store.ContractEvent, registryIDs []
 		}
 		ev, err := decodeDomainEvent(ce)
 		if err != nil {
+			log.Printf("domain_events: skip registry event contract=%s tx=%s topics=%q/%q/%q: %v",
+				ce.ContractID, ce.TransactionHash, deref(ce.Topic1), deref(ce.Topic2), deref(ce.Topic3), err)
 			continue
 		}
 		if ev != nil {

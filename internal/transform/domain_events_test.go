@@ -239,30 +239,160 @@ func TestDomainEventsFromContractEvents_EmptyRegistryIDs(t *testing.T) {
 	}
 }
 
+func TestDomainEventsFromContractEvents_DecodeErrorSkipped(t *testing.T) {
+	t1, t2 := "REGISTRY", "DOMAIN"
+	ce := store.ContractEvent{
+		ContractID:      config.DefaultPublicDomainsRegistry,
+		Topic1:          &t1,
+		Topic2:          &t2,
+		ValueXDR:        "!!!not-xdr!!!",
+		TransactionHash: testTxHash,
+	}
+	got := DomainEventsFromContractEvents([]store.ContractEvent{ce}, []string{config.DefaultPublicDomainsRegistry})
+	if len(got) != 0 {
+		t.Errorf("decode error should skip the event, got %d", len(got))
+	}
+}
+
 func TestDomainEventsFromTransaction_RecordedXDR(t *testing.T) {
-	meta, err := os.ReadFile(filepath.Join("testdata", "domains", "register_meta.xdr"))
+	created := time.Unix(1700000000, 0).UTC()
+	exp := time.Unix(1800000000, 0).UTC()
+
+	cases := []struct {
+		file     string
+		wantType string
+		wantName string
+		topics   []xdr.ScVal
+		data     xdr.ScVal
+	}{
+		{
+			file:     "register_meta.xdr",
+			wantType: store.DomainEventRegister,
+			wantName: "stellar.xlm",
+			topics:   []xdr.ScVal{scSymbol("REGISTRY"), scSymbol("DOMAIN")},
+			data: scMap(
+				"register", scAccount(t, testOwner),
+				"domain", scBytes("stellar"),
+				"tld", scBytes("xlm"),
+				"address", scAccount(t, testResolved),
+				"exp_date", scU64(uint64(exp.Unix())),
+				"amount_paid", scU128(100),
+			),
+		},
+		{
+			file:     "transfer_meta.xdr",
+			wantType: store.DomainEventTransfer,
+			topics: []xdr.ScVal{
+				scSymbol("UPDATE"), scSymbol("RECORD"), scBytesRaw(mustNodeBytes(t)),
+			},
+			data: scMap(
+				"from", scAccount(t, testOwner),
+				"to", scAccount(t, testResolved),
+			),
+		},
+		{
+			file:     "renew_meta.xdr",
+			wantType: store.DomainEventRenew,
+			topics: []xdr.ScVal{
+				scSymbol("RENEW"), scSymbol("DOMAIN"), scBytesRaw(mustNodeBytes(t)),
+			},
+			data: scMap(
+				"payer", scAccount(t, testOwner),
+				"amount_paid", scU128(50),
+				"exp_date", scU64(uint64(exp.Unix())),
+			),
+		},
+		{
+			file:     "claim_meta.xdr",
+			wantType: store.DomainEventClaim,
+			topics: []xdr.ScVal{
+				scSymbol("CLAIM"), scSymbol("DOMAIN"), scBytesRaw(mustNodeBytes(t)),
+			},
+			data: scMap(
+				"register", scAccount(t, testResolved),
+				"address", scAccount(t, testResolved),
+				"exp_date", scU64(uint64(exp.Unix())),
+				"amount_paid", scU128(75),
+			),
+		},
+		{
+			file:     "revoke_meta.xdr",
+			wantType: store.DomainEventRevoke,
+			topics: []xdr.ScVal{
+				scSymbol("EVICT"), scSymbol("DOMAIN"), scBytesRaw(mustNodeBytes(t)),
+			},
+			data: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			wantMeta := mustDomainMetaXDR(t, tc.topics, tc.data)
+			path := filepath.Join("testdata", "domains", tc.file)
+			if os.Getenv("WRITE_DOMAIN_FIXTURES") == "1" {
+				if err := os.WriteFile(path, []byte(wantMeta+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recorded, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("recorded TransactionMeta fixture missing %s: %v", tc.file, err)
+			}
+			if got := string(bytes.TrimSpace(recorded)); got != wantMeta {
+				t.Errorf("fixture %s does not match marshaled TransactionMeta", tc.file)
+			}
+
+			entry := loadTransactionsFixture(t)[0]
+			entry.ResultMetaXDR = string(bytes.TrimSpace(recorded))
+			entry.Ledger = 100
+			entry.CreatedAt = created.Unix()
+
+			ces, err := ContractEventsFromTransaction(entry, "Test SDF Network ; September 2015")
+			if err != nil {
+				t.Fatalf("ContractEventsFromTransaction: %v", err)
+			}
+			got := DomainEventsFromContractEvents(ces, []string{config.DefaultPublicDomainsRegistry})
+			if len(got) != 1 {
+				t.Fatalf("got %d domain events, want 1 (contract events=%d)", len(got), len(ces))
+			}
+			if got[0].EventType != tc.wantType {
+				t.Errorf("EventType = %q, want %q", got[0].EventType, tc.wantType)
+			}
+			if tc.wantName != "" && got[0].Name != tc.wantName {
+				t.Errorf("Name = %q, want %q", got[0].Name, tc.wantName)
+			}
+		})
+	}
+}
+
+func mustDomainMetaXDR(t *testing.T, topics []xdr.ScVal, data xdr.ScVal) string {
+	t.Helper()
+	cid, err := contractIDFromStrkey(config.DefaultPublicDomainsRegistry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry := loadTransactionsFixture(t)[0]
-	entry.ResultMetaXDR = string(bytes.TrimSpace(meta))
-	entry.Ledger = 100
-	entry.CreatedAt = 1700000000
-
-	ces, err := ContractEventsFromTransaction(entry, "Test SDF Network ; September 2015")
+	ce := xdr.ContractEvent{
+		ContractId: cid,
+		Type:       xdr.ContractEventTypeContract,
+		Body: xdr.ContractEventBody{
+			V:  0,
+			V0: &xdr.ContractEventV0{Topics: topics, Data: data},
+		},
+	}
+	meta := xdr.TransactionMeta{
+		V: 3,
+		V3: &xdr.TransactionMetaV3{
+			SorobanMeta: &xdr.SorobanTransactionMeta{
+				Events:      []xdr.ContractEvent{ce},
+				ReturnValue: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+			},
+		},
+	}
+	b64, err := xdr.MarshalBase64(meta)
 	if err != nil {
-		t.Fatalf("ContractEventsFromTransaction: %v", err)
+		t.Fatal(err)
 	}
-	got := DomainEventsFromContractEvents(ces, []string{config.DefaultPublicDomainsRegistry})
-	if len(got) != 1 {
-		t.Fatalf("got %d domain events, want 1 (contract events=%d)", len(got), len(ces))
-	}
-	if got[0].EventType != store.DomainEventRegister {
-		t.Errorf("EventType = %q, want register", got[0].EventType)
-	}
-	if got[0].Name != "stellar.xlm" {
-		t.Errorf("Name = %q, want stellar.xlm", got[0].Name)
-	}
+	return b64
 }
 
 func mustDomainContractEvent(t *testing.T, contractID string, topics []xdr.ScVal, data xdr.ScVal, created time.Time) store.ContractEvent {
